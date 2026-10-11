@@ -1,9 +1,57 @@
 # ==========================================
-# MODULE 1: scraper.py (RapidAPI Real Matchstat Connection)
+# MODULE 1: database.py
+# ==========================================
+"""
+Module: database.py
+Description: Gestion du cache SQLite pour le verrouillage quotidien du coupon.
+"""
+
+import sqlite3
+import json
+from datetime import datetime
+
+DB_FILE = "tennis_bot.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_coupons (
+            date_key TEXT PRIMARY KEY,
+            coupon_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_cached_coupon(date_key: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT coupon_data FROM daily_coupons WHERE date_key = ?', (date_key,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
+def save_cached_coupon(date_key: str, coupon_data: dict):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO daily_coupons (date_key, coupon_data)
+        VALUES (?, ?)
+    ''', (date_key, json.dumps(coupon_data)))
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# MODULE 2: scraper.py (Connexion API Live Officielle)
 # ==========================================
 """
 Module: scraper.py
-Description: Ingestion en direct des matchs de tennis via RapidAPI.
+Description: Extraction rigoureuse des rencontres en direct via RapidAPI.
 """
 
 import requests
@@ -16,36 +64,36 @@ def scrape_real_tennis_matches():
     matches = []
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
-    endpoints = [
-        f"https://{RAPIDAPI_HOST}/tennis/v2/matches/date/{today_str}",
-        f"https://{RAPIDAPI_HOST}/tennis/v2/matches"
-    ]
-    
+    url = f"https://{RAPIDAPI_HOST}/tennis/v2/matches"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
         "x-rapidapi-host": RAPIDAPI_HOST,
         "accept": "application/json"
     }
+    params = {"date": today_str}
     
-    for url in endpoints:
-        try:
-            response = requests.get(url, headers=headers, params={"date": today_str}, timeout=8)
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get("data", []) if isinstance(data, dict) else data
-                
-                if isinstance(items, list) and len(items) > 0:
-                    for item in items[:25]:
-                        p1 = item.get("player1", {}).get("name") or item.get("home_player") or item.get("player1_name")
-                        p2 = item.get("player2", {}).get("name") or item.get("away_player") or item.get("player2_name")
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # Navigation dans la structure de l'API Matchstat
+            events = data.get("result", []) or data.get("data", []) or data
+            
+            if isinstance(events, list):
+                for item in events:
+                    status = str(item.get("status", "")).lower()
+                    # Filtrage strict des matchs à venir
+                    if status in ["notstarted", "scheduled", "not_started", "1", "0", ""]:
+                        p1 = item.get("player1_name") or item.get("home_player")
+                        p2 = item.get("player2_name") or item.get("away_player")
                         
                         if p1 and p2:
-                            tournament = item.get("tournament", {}).get("name") or item.get("tournament_name") or "ATP / WTA Tour"
+                            tournament = item.get("tournament_name") or "ATP / WTA Tour"
                             surface = item.get("surface") or "Hard"
-                            match_time = item.get("time") or item.get("start_time") or "14:00 UTC"
+                            match_time = item.get("time") or "14:00 UTC"
                             
-                            odds_a = float(item.get("odds_1") or item.get("home_odds") or 1.25)
-                            odds_b = float(item.get("odds_2") or item.get("away_odds") or 3.80)
+                            odds_a = float(item.get("odds_1") or 1.25)
+                            odds_b = float(item.get("odds_2") or 3.80)
                             
                             matches.append({
                                 "player_a": str(p1),
@@ -56,11 +104,10 @@ def scrape_real_tennis_matches():
                                 "odds_a": max(1.10, odds_a),
                                 "odds_b": max(1.10, odds_b)
                             })
-                    if matches:
-                        break
-        except Exception as e:
-            pass
+    except Exception as e:
+        print(f"[API Error] Erreur de récupération : {e}")
 
+    # Flux de sécurité si l'API ne renvoie aucun match sur l'instant
     if not matches:
         matches = [
             {"player_a": "Jannik Sinner", "player_b": "Ben Shelton", "tournament": "ATP Tour", "surface": "Hard", "match_hour": "12:30 UTC", "odds_a": 1.18, "odds_b": 4.50},
@@ -73,11 +120,11 @@ def scrape_real_tennis_matches():
 
 
 # ==========================================
-# MODULE 2: engine.py (Simulation Monte-Carlo dynamique)
+# MODULE 3: engine.py (Moteur Quantitatif & Kelly)
 # ==========================================
 """
 Module: engine.py
-Description: Génère des pronostics dynamiques à chaque appel.
+Description: Monte-Carlo (1000 tirages), EV+ et Quarter-Kelly.
 """
 
 import random
@@ -106,7 +153,7 @@ def calculate_advanced_confidence_score(match: dict) -> dict:
         "simulated_prob": round(simulated_prob * 100, 1)
     }
 
-def generate_dynamic_coupon() -> dict:
+def generate_ultra_safe_coupon() -> dict:
     raw_matches = scrape_real_tennis_matches()
     evaluated_picks = []
 
@@ -136,14 +183,27 @@ def generate_dynamic_coupon() -> dict:
                 "odds": fav_odds
             })
 
-    # Mélange aléatoire pour que chaque clic donne une combinaison différente si le nombre de matchs le permet
-    random.shuffle(evaluated_picks)
     evaluated_picks.sort(key=lambda x: x["score"], reverse=True)
 
-    selected_picks = evaluated_picks[:4] if len(evaluated_picks) >= 4 else evaluated_picks
+    selected_picks = []
     combined_odds = 1.0
-    for p in selected_picks:
-        combined_odds *= p["odds"]
+
+    for pick in evaluated_picks:
+        tourney = pick["tournament"]
+        tourney_count = sum(1 for p in selected_picks if p["tournament"] == tourney)
+        
+        if tourney_count < 2 and combined_odds * pick["odds"] <= 25.0:
+            selected_picks.append(pick)
+            combined_odds *= pick["odds"]
+            
+        if len(selected_picks) >= 5 or (combined_odds >= 2.50 and len(selected_picks) >= 4):
+            break
+
+    if len(selected_picks) < 3 and evaluated_picks:
+        selected_picks = evaluated_picks[:4]
+        combined_odds = 1.0
+        for p in selected_picks:
+            combined_odds *= p["odds"]
 
     avg_prob = sum(p.get("score", 0.80) for p in selected_picks) / max(len(selected_picks), 1)
     kelly_fraction = 0.25 * ((avg_prob * combined_odds - 1.0) / (combined_odds - 1.0)) if combined_odds > 1.0 else 0.01
@@ -158,17 +218,43 @@ def generate_dynamic_coupon() -> dict:
 
 
 # ==========================================
-# MODULE 3: main.py
+# MODULE 4: scheduler.py
+# ==========================================
+"""
+Module: scheduler.py
+Description: Planificateur APScheduler verrouillant le coupon unique à 06:00 UTC.
+"""
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
+
+def job_generate_daily_coupon():
+    init_db()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    existing = get_cached_coupon(today_str)
+    
+    if not existing:
+        coupon = generate_ultra_safe_coupon()
+        save_cached_coupon(today_str, coupon)
+
+def start_scheduler():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(job_generate_daily_coupon, 'cron', hour=6, minute=0)
+    scheduler.start()
+    job_generate_daily_coupon()
+
+
+# ==========================================
+# MODULE 5: main.py
 # ==========================================
 """
 Module: main.py
-Description: Serveur HTTP et Bot Telegram interactif (Génération en direct à chaque clic).
+Description: Interface Telegram interactive et serveur HTTP 24/7.
 """
 
 import logging
 import os
 import threading
-from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -182,7 +268,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot Telegram Actif 24/7 (Dynamic Monte-Carlo Core)")
+        self.wfile.write(b"Bot Telegram Actif 24/7 (Singularity Core)")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -197,15 +283,15 @@ def run_http_server():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name
     keyboard = [
-        [InlineKeyboardButton("🎯 Générer un Nouveau Coupon Aléatoire", callback_data="get_coupon")],
+        [InlineKeyboardButton("🎯 Obtenir le Coupon Ultra-Sûr du Jour", callback_data="get_coupon")],
         [InlineKeyboardButton("📊 Analyse & Monte-Carlo Détaillé", callback_data="get_analysis")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     welcome_text = (
-        f"🤖 **Bienvenue {user_name} sur le Bot Singularity (Mode Dynamique)**\n\n"
-        f"Chaque clic génère une nouvelle simulation stochastique en temps réel.\n\n"
-        f"Cliquez ci-dessous pour lancer vos pronostics :"
+        f"🤖 **Bienvenue {user_name} sur le Bot Singularity Supreme**\n\n"
+        f"Moteur quantitatif alimenté par **1 000 simulations de Monte-Carlo** et détection de valeur attendue ($EV^+$).\n\n"
+        f"Cliquez ci-dessous pour consulter le coupon officiel verrouillé du jour :"
     )
     await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
 
@@ -213,12 +299,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Génération instantanée et fraîche à chaque clic
-    coupon = generate_dynamic_coupon()
     today_str = datetime.now().strftime("%Y-%m-%d")
+    coupon = get_cached_coupon(today_str)
+    
+    if not coupon or coupon.get("picks_count", 0) == 0:
+        coupon = generate_ultra_safe_coupon()
+        save_cached_coupon(today_str, coupon)
 
     if query.data == "get_coupon":
-        response_text = f"🎯 **NOUVEAU COUPON DYNAMIQUE — {today_str}** 🎯\n\n"
+        response_text = f"🔒 **COUPON OFFICIEL VERROUILLÉ — {today_str}** 🔒\n\n"
         response_text += f"📊 **Sélections validées :** {coupon['picks_count']}\n"
         response_text += f"📈 **Cote Totale Combinée :** `{coupon['total_odds']}`\n"
         response_text += f"💰 **Mise recommandée :** {coupon['recommended_stake']}\n\n"
@@ -228,16 +317,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response_text += (
                 f"{idx}. **{pick['match']}**\n"
                 f"   🏆 {pick['tournament']} ({pick['surface']})\n"
-                f"   ⏰ Début prévu : `{pick['match_hour']}`\n"
+                f"   ⏰ Début : `{pick['match_hour']}`\n"
                 f"   ✅ `{pick['pick']}` (Cote : `{pick['odds']}`)\n\n"
             )
             
-        response_text += "⚠️ *Simulation Monte-Carlo actualisée à la demande.*"
+        response_text += "⚠️ *Moteur stochastique à réduction de variance.*"
         
-        keyboard = [
-            [InlineKeyboardButton("🔄 Générer un autre coupon", callback_data="get_coupon")],
-            [InlineKeyboardButton("📊 Voir l'Analyse Scientifique", callback_data="get_analysis")]
-        ]
+        keyboard = [[InlineKeyboardButton("📊 Voir l'Analyse Scientifique", callback_data="get_analysis")]]
         await query.edit_message_text(text=response_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif query.data == "get_analysis":
@@ -255,6 +341,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=response_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 def main():
+    init_db()
+    start_scheduler()
+
     server_thread = threading.Thread(target=run_http_server, daemon=True)
     server_thread.start()
 
@@ -262,7 +351,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    print("[BOT DYNAMIQUE EN LIGNE] Prêt à générer à l'infini...")
+    print("[BOT SUPREME EN LIGNE] Moteur actif...")
     application.run_polling()
 
 if __name__ == '__main__':
