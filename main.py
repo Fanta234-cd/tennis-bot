@@ -3,7 +3,7 @@
 # ==========================================
 """
 Module: database.py
-Description: Gestion du cache SQLite assurant l'immutabilité quotidienne.
+Description: Gestion du cache SQLite avec réinitialisation pour rafraîchissement live.
 """
 
 import sqlite3
@@ -23,6 +23,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    conn.commit()
+    conn.close()
+
+def clear_today_cache(date_key: str):
+    """Purge le cache pour forcer un appel API direct."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM daily_coupons WHERE date_key = ?', (date_key,))
     conn.commit()
     conn.close()
 
@@ -50,27 +58,31 @@ def save_cached_coupon(date_key: str, coupon_data: dict):
 
 
 # ==========================================
-# MODULE 2: scraper.py (Connexion Directe RapidAPI Tennis)
+# MODULE 2: scraper.py (RapidAPI Real Matchstat Connection)
 # ==========================================
 """
 Module: scraper.py
-Description: Ingestion en direct des vrais matchs de tennis via RapidAPI (Tennis API).
+Description: Ingestion en direct des vrais matchs de tennis via RapidAPI.
 """
 
 import requests
 from datetime import datetime, timezone
 
-# Clé API RapidAPI extraite
 RAPIDAPI_KEY = "64d72a771amshcf863b61abb832ap155d75jsn2689c3d50a7b"
 RAPIDAPI_HOST = "tennis-api-atp-wta-itf.p.rapidapi.com"
 
 def scrape_real_tennis_matches():
     """
     Extrait les rencontres officielles ATP/WTA/ITF du jour via RapidAPI.
-    Retient uniquement les matchs à venir.
     """
     matches = []
-    url = f"https://{RAPIDAPI_HOST}/tennis/v2/matches"
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    # Endpoints RapidAPI Matchstat
+    endpoints = [
+        f"https://{RAPIDAPI_HOST}/tennis/v2/matches/date/{today_str}",
+        f"https://{RAPIDAPI_HOST}/tennis/v2/matches"
+    ]
     
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
@@ -78,43 +90,45 @@ def scrape_real_tennis_matches():
         "accept": "application/json"
     }
     
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    params = {"date": today_str}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            events = data.get("data", []) if isinstance(data, dict) else data
-            
-            for event in events:
-                # Vérification du statut du match (Non commencé / Futur)
-                status = str(event.get("status", "")).lower()
-                if status in ["notstarted", "scheduled", "1", "0", "not_started"]:
-                    home_player = event.get("home_player", {}).get("name") or event.get("player1_name", "Joueur A")
-                    away_player = event.get("away_player", {}).get("name") or event.get("player2_name", "Joueur B")
-                    tournament = event.get("tournament_name") or event.get("tournament", "ATP / WTA Tour")
-                    surface = event.get("surface", "Hard")
-                    match_time = event.get("time") or event.get("start_time") or "14:00 UTC"
-                    
-                    # Récupération ou estimation des cotes
-                    odds_a = float(event.get("home_odds") or event.get("odds_1") or 1.25)
-                    odds_b = float(event.get("away_odds") or event.get("odds_2") or 3.80)
-                    
-                    matches.append({
-                        "player_a": home_player,
-                        "player_b": away_player,
-                        "tournament": tournament,
-                        "surface": surface,
-                        "match_hour": str(match_time),
-                        "odds_a": max(1.10, odds_a),
-                        "odds_b": max(1.10, odds_b)
-                    })
-    except Exception as e:
-        print(f"[RapidAPI Scraper Warning] Erreur d'extraction live : {e}")
+    for url in endpoints:
+        try:
+            response = requests.get(url, headers=headers, params={"date": today_str}, timeout=8)
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get("data", []) if isinstance(data, dict) else data
+                
+                if isinstance(items, list) and len(items) > 0:
+                    for item in items[:25]:
+                        # Extraction robuste des noms de joueurs
+                        p1 = item.get("player1", {}).get("name") or item.get("home_player") or item.get("player1_name")
+                        p2 = item.get("player2", {}).get("name") or item.get("away_player") or item.get("player2_name")
+                        
+                        if p1 and p2:
+                            tournament = item.get("tournament", {}).get("name") or item.get("tournament_name") or "ATP / WTA Tour"
+                            surface = item.get("surface") or "Hard"
+                            match_time = item.get("time") or item.get("start_time") or "14:00 UTC"
+                            
+                            odds_a = float(item.get("odds_1") or item.get("home_odds") or 1.25)
+                            odds_b = float(item.get("odds_2") or item.get("away_odds") or 3.80)
+                            
+                            matches.append({
+                                "player_a": str(p1),
+                                "player_b": str(p2),
+                                "tournament": str(tournament),
+                                "surface": str(surface),
+                                "match_hour": str(match_time),
+                                "odds_a": max(1.10, odds_a),
+                                "odds_b": max(1.10, odds_b)
+                            })
+                    if matches:
+                        print(f"[Scraper Live Success] {len(matches)} matchs réels extraits depuis RapidAPI.")
+                        break
+        except Exception as e:
+            print(f"[RapidAPI Scraper Notice] Endpoint {url} skipped : {e}")
 
-    # Flux de repli si aucun match futur n'est retourné sur l'endpoint
+    # Secours dynamique si aucun match retourné
     if not matches:
+        print("[Scraper Notice] Activation du flux de secours garanti.")
         matches = [
             {"player_a": "Jannik Sinner", "player_b": "Ben Shelton", "tournament": "ATP Tour", "surface": "Hard", "match_hour": "12:30 UTC", "odds_a": 1.18, "odds_b": 4.50},
             {"player_a": "Carlos Alcaraz", "player_b": "Ugo Humbert", "tournament": "ATP Tour", "surface": "Hard", "match_hour": "14:00 UTC", "odds_a": 1.22, "odds_b": 4.10},
@@ -130,14 +144,12 @@ def scrape_real_tennis_matches():
 # ==========================================
 """
 Module: engine.py
-Description: Moteur de simulation stochastique (1 000 tirages Monte-Carlo)
-             et calcul d'Allocation Quarter-Kelly.
+Description: Moteur de simulation stochastique (1 000 tirages Monte-Carlo).
 """
 
 import random
 
 def run_monte_carlo_simulation(win_probability: float, simulations: int = 1000) -> float:
-    """Exécute 1000 simulations stochastiques pour vérifier la probabilité."""
     wins = sum(1 for _ in range(simulations) if random.random() < win_probability)
     return wins / simulations
 
@@ -152,7 +164,6 @@ def calculate_advanced_confidence_score(match: dict) -> dict:
     base_prob = 1.0 / fav_odds
     adjusted_prob = min(0.93, base_prob * 1.02)
     
-    # 1000 tirages de Monte-Carlo
     simulated_prob = run_monte_carlo_simulation(adjusted_prob, 1000)
     expected_value = (simulated_prob * fav_odds) - 1.0
     
@@ -161,7 +172,6 @@ def calculate_advanced_confidence_score(match: dict) -> dict:
         "ev": round(expected_value, 4),
         "simulated_prob": round(simulated_prob * 100, 1)
     }
-
 
 def generate_ultra_safe_coupon() -> dict:
     try:
@@ -200,7 +210,6 @@ def generate_ultra_safe_coupon() -> dict:
 
     evaluated_picks.sort(key=lambda x: x["score"], reverse=True)
 
-    # Décorrelation des choix
     selected_picks = []
     combined_odds = 1.0
 
@@ -221,7 +230,6 @@ def generate_ultra_safe_coupon() -> dict:
         for p in selected_picks:
             combined_odds *= p["odds"]
 
-    # Quarter-Kelly Staking
     avg_prob = sum(p.get("score", 0.80) for p in selected_picks) / max(len(selected_picks), 1)
     kelly_fraction = 0.25 * ((avg_prob * combined_odds - 1.0) / (combined_odds - 1.0)) if combined_odds > 1.0 else 0.01
     safe_stake = max(1.0, min(kelly_fraction * 100.0, 2.0))
@@ -239,7 +247,7 @@ def generate_ultra_safe_coupon() -> dict:
 # ==========================================
 """
 Module: scheduler.py
-Description: Planificateur APScheduler verrouillant le coupon quotidien à 06:00.
+Description: Planificateur APScheduler du coupon quotidien à 06:00 UTC.
 """
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -248,11 +256,8 @@ from datetime import datetime
 def job_generate_daily_coupon():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
-    existing = get_cached_coupon(today_str)
-    
-    if not existing:
-        coupon = generate_ultra_safe_coupon()
-        save_cached_coupon(today_str, coupon)
+    coupon = generate_ultra_safe_coupon()
+    save_cached_coupon(today_str, coupon)
 
 def start_scheduler():
     scheduler = BackgroundScheduler()
@@ -266,7 +271,7 @@ def start_scheduler():
 # ==========================================
 """
 Module: main.py
-Description: Serveur Web HTTP et Interface Telegram Interactive.
+Description: Interface Telegram interactive et serveur HTTP 24/7.
 """
 
 import logging
@@ -338,7 +343,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   ✅ `{pick['pick']}` (Cote : `{pick['odds']}`)\n\n"
             )
             
-        response_text += "⚠️ *Moteur stochastique connecté à RapidAPI (Live ATP/WTA).*"
+        response_text += "⚠️ *Moteur stochastique connecté à RapidAPI (Live ATP/WTA).* "
         
         keyboard = [[InlineKeyboardButton("📊 Voir l'Analyse Scientifique", callback_data="get_analysis")]]
         await query.edit_message_text(text=response_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -359,6 +364,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+    
+    # Réinitialisation du cache SQLite du jour pour appliquer le direct RapidAPI
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    clear_today_cache(today_str)
+    
     start_scheduler()
 
     server_thread = threading.Thread(target=run_http_server, daemon=True)
