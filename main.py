@@ -316,12 +316,12 @@ def start_scheduler():
 
 
 # ==========================================
-# MODULE 5: main.py (Avec serveur HTTP pour Render/UptimeRobot)
+# MODULE 5: main.py (Avec HealthCheck HEAD/GET pour UptimeRobot)
 # ==========================================
 """
 Module: main.py
 Description: Interface Telegram asynchrone et serveur HTTP intégré 
-             pour maintenir l'application éveillée 24/7 via UptimeRobot.
+             supportant GET et HEAD pour UptimeRobot 24/7.
 """
 
 import logging
@@ -342,6 +342,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Bot Telegram Actif 24/7 (Singularity Core)")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
 
 def run_http_server():
     port = int(os.environ.get("PORT", 10000))
